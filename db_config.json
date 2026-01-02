@@ -1,8 +1,1 @@
-{
-    "host": "localhost",
-    "port": 3306,
-    "database": "fall_detection_db",
-    "user": "root",
-    "password": "",
-    "offline_mode": true
-}
+{"host": "localhost", "port": 3306, "database": "darsinurse", "user": "root", "password": "darsinurse123"}

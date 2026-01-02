@@ -12,6 +12,7 @@ from mysql.connector import Error
 MODERN_STYLE = """
 QMainWindow { background: #1a1a2e; }
 QWidget { color: #eaeaea; font-family: 'Segoe UI'; }
+QDialog QLabel { color: #333333; font-weight: 600; }
 QGroupBox { border: 2px solid #0f3460; border-radius: 8px; padding: 12px; background: rgba(15,52,96,0.3); }
 QPushButton { background: #0f3460; border: 2px solid #00d4ff; border-radius: 6px; padding: 8px; color: white; }
 QPushButton#startBtn { background: qlineargradient(x1:0,y1:0,x2:0,y2:1,stop:0 #00d4ff,stop:1 #0099cc); }
@@ -69,6 +70,71 @@ class VideoThread(QThread):
 
     def stop(self):
         self.is_running = False
+#RIN
+class DbPollThread(QThread): # to monitor DB for fall status per 1 detik
+    fall_signal = Signal()
+    status_signal = Signal(int, str)  # fall, timestamp
+
+    def __init__(self, db_config, room_id):
+        super().__init__()
+        self.db_config = db_config
+        self.room_id = room_id
+        self.running = True
+        self.last_seen_ts = None
+
+    def run(self):
+        conn = None
+        cur = None
+        while self.running:
+            try:
+                if conn is None or not conn.is_connected():
+                    conn = mysql.connector.connect(
+                        host=self.db_config["host"],
+                        port=self.db_config["port"],
+                        user=self.db_config["user"],
+                        password=self.db_config["password"],
+                        database=self.db_config["database"],
+                        autocommit=True,
+                        connect_timeout=10
+                    )
+                    cur = conn.cursor()
+
+                # GANTI nama tabel/kolom sesuai DB kamu
+                cur.execute("""
+                    SELECT fall_detected, updated_at
+                    FROM fall_status
+                    WHERE room_id=%s
+                    ORDER BY updated_at DESC
+                    LIMIT 1
+                """, (self.room_id,))
+
+                row = cur.fetchone()
+                if row:
+                    fall, ts = row[0], row[1]
+                    ts_str = str(ts)
+
+                    # emit status untuk ditampilkan
+                    self.status_signal.emit(int(fall), ts_str)
+
+                    # trigger hanya kalau ada update baru + fall=1
+                    if self.last_seen_ts != ts_str and int(fall) == 1:
+                        self.fall_signal.emit()
+                    self.last_seen_ts = ts_str
+
+            except Exception:
+                # kalau error, coba lagi
+                pass
+
+            self.msleep(1000)
+
+        try:
+            if cur: cur.close()
+            if conn: conn.close()
+        except:
+            pass
+
+    def stop(self):
+        self.running = False
 
 
 class FallAlarmTester(QMainWindow):
@@ -85,6 +151,15 @@ class FallAlarmTester(QMainWindow):
 
         self.init_ui()
         self.connect_db()
+
+        #RIN
+        self.room_id = "EXECUTIVE-3"   # perbaikan, samakan dengan room_id yang ditulis alat ke DB
+
+        self.db_poll = DbPollThread(self.db_config, self.room_id)
+        self.db_poll.fall_signal.connect(self.on_fall_from_device)
+        self.db_poll.status_signal.connect(self.on_status_from_device)
+        self.db_poll.start()
+    
 
     def load_db_config(self):
         config_file = 'db_config.json'
@@ -241,7 +316,7 @@ class FallAlarmTester(QMainWindow):
 
     def start_video(self):
         if not self.video_path:
-            QMessageBox.warning(self, "Select a video first!")
+            QMessageBox.warning(self, "video not selected", "Please select a video file before starting.")
             return
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
@@ -256,8 +331,10 @@ class FallAlarmTester(QMainWindow):
         self.video_thread.start()
 
     def stop_video(self):
-        if self.video_thread:
-            self.video_thread.stop()
+         if self.video_thread:
+            self.video_thread.stop()   
+            self.video_thread.wait()   
+            self.on_video_finished()       
 
     def on_video_finished(self):
         self.start_btn.setEnabled(True)
@@ -297,10 +374,25 @@ class FallAlarmTester(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "DB Error", str(e))
 
+    #RIN
+    def on_status_from_device(self, fall, ts):
+        if fall == 1:
+            self.status_label.setText(f"🚨 FALL dari alat! ({self.room_id}) @ {ts}")
+            self.status_label.setStyleSheet("color: #ff4757; font-weight: bold;")
+        else:
+            self.status_label.setText(f"🟢 OK ({self.room_id}) @ {ts}")
+            self.status_label.setStyleSheet("color: #00ff00;")
+
+    def on_fall_from_device(self):
+        if self.video_path and (self.video_thread is None or not self.video_thread.isRunning()):
+            self.start_video()
+            self.trigger_fall()
+
     def show_history(self):
         if not (self.db_conn and self.db_conn.is_connected()):
             QMessageBox.critical(self, "Error", "DB not connected!")
             return
+             
         dialog = QDialog(self)
         dialog.setWindowTitle("History")
         dialog.resize(900, 500)
@@ -321,6 +413,10 @@ class FallAlarmTester(QMainWindow):
         dialog.exec()
 
     def closeEvent(self, e):
+        #RIN
+        if hasattr(self, "db_poll") and self.db_poll:
+            self.db_poll.stop()
+            self.db_poll.wait()
         if self.video_thread:
             self.video_thread.stop()
             self.video_thread.wait()
