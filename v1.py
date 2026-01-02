@@ -1,4 +1,3 @@
-#tcoding: utf-8
 import sys
 import cv2
 import json
@@ -23,11 +22,18 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
     QHeaderView,
+    QCheckBox,
 )
-from PySide6.QtCore import QThread, Signal, Qt, QMutex, QWaitCondition, QTimer
+from PySide6.QtCore import QThread, Signal, Qt, QMutex, QWaitCondition
 from PySide6.QtGui import QImage, QPixmap, QFont
 
 import mysql.connector
+
+# MQTT optional
+try:
+    import paho.mqtt.client as mqtt
+except Exception:
+    mqtt = None
 
 
 MODERN_STYLE = """
@@ -45,18 +51,107 @@ QLabel#statusLabel { font-weight: bold; }
 """
 
 
+def fmt_mmss(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    return f"{seconds//60:02}:{seconds%60:02}"
+
+
+def payload_is_fall(payload: dict) -> bool:
+    """
+    Heuristik deteksi 'jatuh' dari payload mmWave.
+    Kamu bisa sesuaikan sesuai format MR60FDA2 di RSI.
+    """
+    # paling umum
+    if payload.get("fall_detected") in (1, True, "1", "true", "TRUE"):
+        return True
+
+    # beberapa device pakai event/type/status
+    for k in ("event", "type", "status", "alarm"):
+        v = payload.get(k)
+        if isinstance(v, str) and "fall" in v.lower():
+            return True
+
+    # contoh lain: classification = FALL
+    v = payload.get("classification")
+    if isinstance(v, str) and v.lower() == "fall":
+        return True
+
+    return False
+
+
+class MmwaveMqttThread(QThread):
+    status = Signal(str)
+    message = Signal(dict)
+
+    def __init__(self, host, port, topic, username="", password=""):
+        super().__init__()
+        self.host = host
+        self.port = int(port)
+        self.topic = topic
+        self.username = username or ""
+        self.password = password or ""
+        self._stop = False
+        self._client = None
+        self.monitoring_armed = False
+
+    def run(self):
+        if mqtt is None:
+            self.status.emit("MQTT lib missing (pip install paho-mqtt)")
+            return
+
+        def on_connect(client, userdata, flags, rc):
+            if rc == 0:
+                self.status.emit("🟢 mmWave MQTT Connected")
+                client.subscribe(self.topic)
+            else:
+                self.status.emit(f"🔴 mmWave MQTT Connect Failed rc={rc}")
+
+        def on_message(client, userdata, msg):
+            try:
+                raw = msg.payload.decode("utf-8", errors="ignore")
+                data = json.loads(raw) if raw.strip().startswith("{") else {"raw": raw}
+                data["_topic"] = msg.topic
+                self.message.emit(data)
+            except Exception as e:
+                self.status.emit(f"mmWave parse error: {e}")
+
+        self._client = mqtt.Client()
+        if self.username:
+            self._client.username_pw_set(self.username, self.password)
+
+        self._client.on_connect = on_connect
+        self._client.on_message = on_message
+
+        try:
+            self._client.connect(self.host, self.port, 60)
+            self._client.loop_start()
+            while not self._stop:
+                self.msleep(100)
+        except Exception as e:
+            self.status.emit(f"mmWave MQTT error: {e}")
+        finally:
+            try:
+                if self._client:
+                    self._client.loop_stop()
+                    self._client.disconnect()
+            except Exception:
+                pass
+
+    def stop(self):
+        self._stop = True
+
+
 class VideoThread(QThread):
     change_pixmap = Signal(QImage)
     update_time = Signal(str)
-    out_of_bed = Signal()
-    fall_detected = Signal()
+    update_time_sec = Signal(float)
+    fall_by_timer = Signal()  # fallback timer trigger
     finished = Signal()
 
-    def __init__(self, video_path, fall_time_sec, out_of_bed_time_sec=None, start_frame=0, fall_already_triggered=False):
+    def __init__(self, video_path, fall_time_sec, start_frame=0, fall_already_triggered=False):
         super().__init__()
         self.video_path = video_path
         self.fall_time_sec = fall_time_sec
-        self.out_of_bed_time_sec = out_of_bed_time_sec
 
         self._stop = False
         self._paused = False
@@ -66,7 +161,6 @@ class VideoThread(QThread):
         self.start_frame = start_frame
         self.current_frame = start_frame
         self.fall_triggered = fall_already_triggered
-        self.out_of_bed_triggered = False
 
     def run(self):
         cap = cv2.VideoCapture(self.video_path)
@@ -100,19 +194,11 @@ class VideoThread(QThread):
             cur = f"{int(current_time//60):02}:{int(current_time%60):02}"
             tot = f"{int(total_time//60):02}:{int(total_time%60):02}"
             self.update_time.emit(f"{cur} / {tot}")
+            self.update_time_sec.emit(current_time)
 
-            # keluar kasur
-            if (
-                self.out_of_bed_time_sec is not None
-                and (not self.out_of_bed_triggered)
-                and current_time >= self.out_of_bed_time_sec
-            ):
-                self.out_of_bed.emit()
-                self.out_of_bed_triggered = True
-
-            # jatuh
+            # fallback timer trigger
             if (not self.fall_triggered) and current_time >= self.fall_time_sec:
-                self.fall_detected.emit()
+                self.fall_by_timer.emit()
                 self.fall_triggered = True
 
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -146,6 +232,12 @@ class VideoThread(QThread):
         self._mutex.unlock()
         return p
 
+    def mark_fall_triggered(self):
+        # dipanggil dari UI saat mmWave trigger
+        self._mutex.lock()
+        self.fall_triggered = True
+        self._mutex.unlock()
+
 
 class FallAlarmTester(QMainWindow):
     def __init__(self):
@@ -156,6 +248,7 @@ class FallAlarmTester(QMainWindow):
 
         self.video_path = None
         self.video_thread = None
+        self.mmwave_thread = None
 
         self.db_config = self.load_db_config()
         self.app_config = self.load_app_config()
@@ -164,18 +257,11 @@ class FallAlarmTester(QMainWindow):
         self.last_frame = 0
         self.fall_triggered = False
         self.current_time_str = "00:00"
-        # ===== State untuk waspada/bahaya =====
-        self.out_of_bed_started = False
-        self.out_of_bed_seconds = 0
-        self.warning_sent = False
-        self.fall_sent = False
-
-        self.oob_timer = QTimer(self)
-        self.oob_timer.setInterval(1000)  # tick tiap 1 detik
-        self.oob_timer.timeout.connect(self.on_oob_tick)
+        self.current_time_sec = 0.0
 
         self.init_ui()
         self.connect_db()
+        self.start_mmwave_if_enabled()
 
     # ─── LOAD & SAVE: DB CONFIG ─────────────────────────────────────
     def load_db_config(self):
@@ -215,13 +301,32 @@ class FallAlarmTester(QMainWindow):
     # ─── LOAD & SAVE: APP CONFIG ────────────────────────────────────
     def load_app_config(self):
         config_file = "app_config.json"
-        default = {"table_name": "fall_events", "room_id": "ROOM_01", "device_id": "CAM_001"}
+        default = {
+            "table_name": "fall_events",
+            "room_id": "ROOM_01",
+            "device_id": "CAM_001",
+            "mmwave": {
+                "enabled": False,
+                "transport": "mqtt",
+                "host": "127.0.0.1",
+                "port": 1883,
+                "topic": "rsi/mmwave/#",
+                "username": "",
+                "password": "",
+            },
+        }
         if os.path.exists(config_file):
             try:
                 with open(config_file, "r", encoding="utf-8") as f:
                     data = json.load(f)
+                # merge defaults
                 for k, v in default.items():
                     data.setdefault(k, v)
+                if "mmwave" not in data or not isinstance(data["mmwave"], dict):
+                    data["mmwave"] = default["mmwave"]
+                else:
+                    for k, v in default["mmwave"].items():
+                        data["mmwave"].setdefault(k, v)
                 return data
             except Exception:
                 return default
@@ -231,7 +336,9 @@ class FallAlarmTester(QMainWindow):
         return default
 
     def save_app_config(self, table_name, room_id, device_id):
-        self.app_config = {"table_name": table_name, "room_id": room_id, "device_id": device_id}
+        # mmwave section keep as is
+        mmw = self.app_config.get("mmwave", {})
+        self.app_config = {"table_name": table_name, "room_id": room_id, "device_id": device_id, "mmwave": mmw}
         with open("app_config.json", "w", encoding="utf-8") as f:
             json.dump(self.app_config, f, indent=4)
 
@@ -262,34 +369,19 @@ class FallAlarmTester(QMainWindow):
             self.db_status.setText("🔴 Disconnected")
             self.db_status.setStyleSheet("color: #ff4757;")
 
-    def trigger_fall(self):
-    # status 2 = bahaya (jatuh)
-        if self.fall_sent:
-            return
-        self.fall_sent = True
-        self.oob_timer.stop()
-
-        try:
-            self.insert_to_vitals(
-                status=2,
-                heart_rate=90,
-                respirasi=22,
-                sistolik=120,
-                diastolik=80
-            )
-
-            self.status_label.setText("🚨 BAHAYA: JATUH TERDETEKSI! (2)")
-            self.status_label.setStyleSheet("color: #ff4757; font-weight: bold;")
-
-            QMessageBox.warning(
-                self,
-                "🚨 FALL ALERT",
-                f"EMR: {self.emr_input.text()}\nStatus: 2 (Bahaya/Jatuh)\nVideo time: {self.current_time_str}"
-            )
-        except Exception as e:
-            QMessageBox.critical(self, "DB Error", str(e))
-
-
+    def setup_table(self):
+        cursor = self.db_conn.cursor()
+        table = self.app_config["table_name"]
+        cursor.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS `{table}` (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                data JSON NOT NULL
+            ) ENGINE=InnoDB
+            """
+        )
+        cursor.close()
 
     # ─── UI ─────────────────────────────────────────────────────────
     def init_ui(self):
@@ -311,6 +403,18 @@ class FallAlarmTester(QMainWindow):
         db_row.addWidget(QPushButton("🔄 Reconnect", clicked=self.connect_db))
         layout.addLayout(db_row)
 
+        # mmWave toggle row
+        mmw_row = QHBoxLayout()
+        self.mmwave_checkbox = QCheckBox("Use mmWave (LIVE)")
+        self.mmwave_checkbox.setChecked(bool(self.app_config.get("mmwave", {}).get("enabled", False)))
+        self.mmwave_checkbox.stateChanged.connect(self.on_mmwave_toggle)
+        mmw_row.addWidget(self.mmwave_checkbox)
+        self.mmwave_status = QLabel("mmWave: idle")
+        self.mmwave_status.setStyleSheet("color:#aaa;")
+        mmw_row.addWidget(self.mmwave_status)
+        mmw_row.addStretch()
+        layout.addLayout(mmw_row)
+
         vid_row = QHBoxLayout()
         vid_row.addWidget(QPushButton("📁 Select Video", clicked=self.select_video))
         self.vid_label = QLabel("No video selected")
@@ -319,39 +423,16 @@ class FallAlarmTester(QMainWindow):
         layout.addLayout(vid_row)
 
         time_row = QHBoxLayout()
-        time_row.addWidget(QLabel("⏰ Fall at:"))
-        # ===== Input EMR & Out-of-bed simulation =====
-        meta_row = QHBoxLayout()
-        meta_row.addWidget(QLabel("EMR No:"))
-        self.emr_input = QLineEdit("1")  # emr_no di DB kamu INT
-        self.emr_input.setMaximumWidth(120)
-        meta_row.addWidget(self.emr_input)
-
-        meta_row.addSpacing(20)
-        meta_row.addWidget(QLabel("🚶 Out of bed at:"))
-        self.oob_min = QSpinBox(minimum=0, maximum=59, value=0, suffix=" min")
-        self.oob_sec = QSpinBox(minimum=0, maximum=59, value=10, suffix=" sec")
-        meta_row.addWidget(self.oob_min)
-        meta_row.addWidget(QLabel(":"))
-        meta_row.addWidget(self.oob_sec)
-
-        meta_row.addSpacing(20)
-        meta_row.addWidget(QLabel("⚠️ Warn after:"))
-        self.warn_minutes = QSpinBox(minimum=1, maximum=120, value=5, suffix=" min")
-        meta_row.addWidget(self.warn_minutes)
-
-        meta_row.addStretch()
-        layout.addLayout(meta_row)
-
-        self.min_spin = QSpinBox(minimum=0, maximum=59, value=1, suffix=" min")
-        self.sec_spin = QSpinBox(minimum=0, maximum=59, value=30, suffix=" sec")
+        time_row.addWidget(QLabel("⏰ Fall at (fallback):"))
+        self.min_spin = QSpinBox(minimum=0, maximum=59, value=0, suffix=" min")
+        self.sec_spin = QSpinBox(minimum=0, maximum=59, value=10, suffix=" sec")
         time_row.addWidget(self.min_spin)
         time_row.addWidget(QLabel(":"))
         time_row.addWidget(self.sec_spin)
         time_row.addStretch()
         layout.addLayout(time_row)
 
-        # Buttons (equal width + stable layout)
+        # Buttons
         btn_row = QHBoxLayout()
         btn_row.setSpacing(12)
 
@@ -379,7 +460,6 @@ class FallAlarmTester(QMainWindow):
         self.video_display.setMinimumSize(400, 300)
         self.video_display.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.video_display.setAlignment(Qt.AlignCenter)
-        # click video to pause/resume
         self.video_display.mousePressEvent = self.on_video_clicked
         layout.addWidget(self.video_display)
 
@@ -390,6 +470,62 @@ class FallAlarmTester(QMainWindow):
         layout.addWidget(self.status_label)
 
         layout.addWidget(QPushButton("View History", clicked=self.show_history))
+
+    # ─── mmWave toggle ───────────────────────────────────────────────
+    def on_mmwave_toggle(self, state):
+        enabled = (state == Qt.Checked)
+        self.app_config["mmwave"]["enabled"] = enabled
+        with open("app_config.json", "w", encoding="utf-8") as f:
+            json.dump(self.app_config, f, indent=4)
+        self.start_mmwave_if_enabled()
+
+    def start_mmwave_if_enabled(self):
+        # stop existing
+        if self.mmwave_thread and self.mmwave_thread.isRunning():
+            self.mmwave_thread.stop()
+            self.mmwave_thread.wait(1000)
+        self.mmwave_thread = None
+
+        mmw = self.app_config.get("mmwave", {})
+        if not mmw.get("enabled", False):
+            self.mmwave_status.setText("mmWave: disabled")
+            self.mmwave_status.setStyleSheet("color:#aaa;")
+            return
+
+        if mqtt is None:
+            self.mmwave_status.setText("mmWave: paho-mqtt not installed")
+            self.mmwave_status.setStyleSheet("color:#ff4757;")
+            return
+
+        self.mmwave_thread = MmwaveMqttThread(
+            host=mmw.get("host", "127.0.0.1"),
+            port=mmw.get("port", 1883),
+            topic=mmw.get("topic", "rsi/mmwave/#"),
+            username=mmw.get("username", ""),
+            password=mmw.get("password", ""),
+        )
+        self.mmwave_thread.status.connect(self.on_mmwave_status)
+        self.mmwave_thread.message.connect(self.on_mmwave_message)
+        self.mmwave_thread.start()
+        self.mmwave_status.setText("mmWave: connecting...")
+        self.mmwave_status.setStyleSheet("color:#00d4ff;")
+
+    def on_mmwave_status(self, s: str):
+        self.mmwave_status.setText(s)
+        if "🟢" in s:
+            self.mmwave_status.setStyleSheet("color:#00ff00;")
+        elif "🔴" in s or "error" in s.lower() or "missing" in s.lower():
+            self.mmwave_status.setStyleSheet("color:#ff4757;")
+        else:
+            self.mmwave_status.setStyleSheet("color:#00d4ff;")
+
+    def on_mmwave_message(self, payload: dict):
+        # ✅ boleh trigger kalau monitoring_armed = True
+        if not self.monitoring_armed:
+            return
+
+        if payload_is_fall(payload):
+            self.trigger_fall(source="mmwave", raw_payload=payload)
 
     # ─── Click video to pause/resume ────────────────────────────────
     def on_video_clicked(self, event):
@@ -480,58 +616,111 @@ class FallAlarmTester(QMainWindow):
             self.vid_label.setText(os.path.basename(path))
             self.vid_label.setStyleSheet("color: #00d4ff;")
 
-    def start_video(self):
+        use_live = self.mmwave_checkbox.isChecked() if hasattr(self, "mmwave_checkbox") else False
+
         if not self.video_path:
-            QMessageBox.warning(self, "Warning", "Select a video first!")
-            return
+            if use_live:
+                self.monitoring_armed = True
+                self.fall_triggered = False
+                self.current_time_str = "00:00"
+                self.current_time_sec = 0.0
 
-        if self.video_thread and self.video_thread.isRunning():
-            if self.video_thread.is_paused():
-                self.video_thread.toggle_pause()
-                self.pause_btn.setText("⏸️ PAUSE")
-            return
+                self.start_btn.setEnabled(False)
+                self.pause_btn.setEnabled(False)   # ga ada video, jadi pause tidak perlu
+                self.stop_btn.setEnabled(True)
 
-        # reset status setiap start
-        self.out_of_bed_started = False
-        self.out_of_bed_seconds = 0
-        self.warning_sent = False
-        self.fall_sent = False
-        self.oob_timer.stop()
+                self.status_label.setText("🟢 LIVE Monitoring (mmWave) - waiting fall...")
+                self.status_label.setStyleSheet("color: #00d4ff;")
+                return
+        # else:
+        #     QMessageBox.warning(self, "Warning", "Select a video first!")
+        #     return
+            
+        self.monitoring_armed = True
+        self.fall_triggered = False
+        self.last_frame = 0
 
         self.start_btn.setEnabled(False)
         self.pause_btn.setEnabled(True)
         self.stop_btn.setEnabled(True)
 
-        self.status_label.setText("▶️ Monitoring...")
+        self.status_label.setText("▶️ Monitoring... (mmWave LIVE + fallback timer)")
         self.status_label.setStyleSheet("color: #00d4ff;")
 
-        fall_sec = self.min_spin.value() * 60 + self.sec_spin.value()
-        out_of_bed_sec = self.oob_min.value() * 60 + self.oob_sec.value()
+        total_sec = self.min_spin.value() * 60 + self.sec_spin.value()
 
         self.video_thread = VideoThread(
             self.video_path,
-            fall_sec,
-            out_of_bed_time_sec=out_of_bed_sec,
+            total_sec,
             start_frame=self.last_frame,
             fall_already_triggered=self.fall_triggered,
         )
         self.video_thread.change_pixmap.connect(self.update_frame)
         self.video_thread.update_time.connect(self.update_time)
-        self.video_thread.out_of_bed.connect(self.trigger_out_of_bed)
-        self.video_thread.fall_detected.connect(self.trigger_fall)
+        self.video_thread.update_time_sec.connect(self.update_time_sec)
+        self.video_thread.fall_by_timer.connect(lambda: self.trigger_fall(source="fallback_timer", raw_payload={"fall_at_sec": total_sec}))
+        self.video_thread.finished.connect(self.on_video_finished)
+        self.video_thread.start()
+    def start_video(self):
+        use_live = self.mmwave_checkbox.isChecked() if hasattr(self, "mmwave_checkbox") else False
+        if not self.video_path:
+            if use_live:
+                # LIVE boleh tanpa video
+                self.monitoring_armed = True
+                self.fall_triggered = False
+                self.current_time_str = "00:00"
+                self.current_time_sec = 0.0
+
+                self.start_btn.setEnabled(False)
+                self.pause_btn.setEnabled(False)
+                self.stop_btn.setEnabled(True)
+
+                self.status_label.setText("🟢 LIVE Monitoring (mmWave) - waiting fall...")
+                self.status_label.setStyleSheet("color: #00d4ff;")
+                return
+            else:
+                QMessageBox.warning(self, "Warning", "Select a video first!")
+                return
+
+        # ✅ Kalau video ada → play video (HYBRID)
+        self.monitoring_armed = True
+        self.fall_triggered = False
+        self.last_frame = 0
+
+        self.start_btn.setEnabled(False)
+        self.pause_btn.setEnabled(True)
+        self.stop_btn.setEnabled(True)
+
+        if use_live:
+            self.status_label.setText("▶️ Monitoring... (mmWave LIVE + fallback timer)")
+        else:
+            self.status_label.setText("▶️ Monitoring... (fallback timer only)")
+        self.status_label.setStyleSheet("color: #00d4ff;")
+
+        total_sec = self.min_spin.value() * 60 + self.sec_spin.value()
+
+        self.video_thread = VideoThread(
+            self.video_path,
+            total_sec,
+            start_frame=self.last_frame,
+            fall_already_triggered=self.fall_triggered,
+        )
+        self.video_thread.change_pixmap.connect(self.update_frame)
+        self.video_thread.update_time.connect(self.update_time)
+        self.video_thread.update_time_sec.connect(self.update_time_sec)
+        self.video_thread.fall_by_timer.connect(
+            lambda: self.trigger_fall(source="fallback_timer", raw_payload={"fall_at_sec": total_sec})
+        )
         self.video_thread.finished.connect(self.on_video_finished)
         self.video_thread.start()
 
     def stop_video(self):
         if self.video_thread and self.video_thread.isRunning():
-            # Save last state, then stop quickly
-            self.last_frame = self.video_thread.current_frame
-            self.fall_triggered = self.video_thread.fall_triggered
-
+            self.monitoring_armed = False
             self.video_thread.stop()
             self.video_thread.wait(1000)
 
-        # STOP = reset to beginning
+        # STOP = reset
         self.last_frame = 0
         self.fall_triggered = False
 
@@ -543,12 +732,12 @@ class FallAlarmTester(QMainWindow):
         self.status_label.setText("⏹️ Stopped (reset)")
         self.status_label.setStyleSheet("color: #ff4757; font-weight: bold;")
         self.time_label.setText("00:00 / 00:00")
+        self.current_time_sec = 0.0
+        self.monitoring_armed = False
+        self.current_time_str = "00:00"
 
     def on_video_finished(self):
-        if self.video_thread:
-            self.last_frame = self.video_thread.current_frame
-            self.fall_triggered = self.video_thread.fall_triggered
-
+        self.monitoring_armed = False
         self.last_frame = 0
         self.fall_triggered = False
         self.video_thread = None
@@ -570,59 +759,40 @@ class FallAlarmTester(QMainWindow):
     def update_time(self, t):
         self.time_label.setText(f"⏱️ {t}")
         self.current_time_str = t.split("/")[0].strip()
-    
-    def insert_to_vitals(self, status: int, heart_rate=None, respirasi=None, sistolik=None, diastolik=None):
-        if not (self.db_conn and self.db_conn.is_connected()):
-            raise RuntimeError("DB not connected")
 
-        emr_text = (self.emr_input.text() or "").strip()
-        if not emr_text.isdigit():
-            raise ValueError("EMR No harus angka (int)")
+    def update_time_sec(self, s: float):
+        self.current_time_sec = s
 
-        emr_no = int(emr_text)
-
-        cursor = self.db_conn.cursor()
-        sql = """
-        INSERT INTO vitals
-        (emr_no, waktu, heart_rate, respirasi, sistolik, diastolik, fall_detected)
-        VALUES (%s, NOW(), %s, %s, %s, %s, %s)
-        """
-        cursor.execute(sql, (emr_no, heart_rate, respirasi, sistolik, diastolik, status))
-        cursor.close()
-
-    # ─── OUT OF BED TIMER ────────────────────────────────────────────
-    def on_oob_tick(self):
-        if self.fall_sent:
-            self.oob_timer.stop()
+    # ─── FALL EVENT -> DB (HYBRID) ───────────────────────────────────
+    def trigger_fall(self, source="fallback_timer", raw_payload=None):
+        # anti double trigger
+        if self.fall_triggered:
             return
+        self.fall_triggered = True
 
-        self.out_of_bed_seconds += 1
-        warn_after_sec = self.warn_minutes.value() * 60
+        # stop timer-trigger in VideoThread
+        if self.video_thread:
+            self.video_thread.mark_fall_triggered()
 
-        # kalau sudah lewat 5 menit dan belum kirim waspada
-        if (not self.warning_sent) and self.out_of_bed_seconds >= warn_after_sec:
-            try:
-                self.insert_to_vitals(status=1, heart_rate=90, respirasi=22, sistolik=120, diastolik=80)
-                self.warning_sent = True
-                self.status_label.setText("⚠️ WASPADA: Tidak di kasur > 5 menit")
-                self.status_label.setStyleSheet("color: #ffd32a; font-weight: bold;")
-            except Exception as e:
-                QMessageBox.critical(self, "DB Error", str(e))
-                self.oob_timer.stop()
+        # kalau trigger dari mmWave, otomatis set fall-at spinbox mengikuti waktu sekarang (biar terlihat sinkron)
+        if source == "mmwave":
+            sec_now = int(self.current_time_sec)
+            self.min_spin.setValue(sec_now // 60)
+            self.sec_spin.setValue(sec_now % 60)
 
-    # ─── FALL EVENT -> DB ────────────────────────────────────────────
-    def trigger_fall(self):
         if not (self.db_conn and self.db_conn.is_connected()):
             QMessageBox.critical(self, "Error", "DB not connected!")
             return
+
         try:
             data = {
                 "room_id": self.app_config["room_id"],
                 "device_id": self.app_config["device_id"],
                 "video_time": self.current_time_str,
-                "rr": 0,
-                "hr": 0,
+                "video_sec": round(float(self.current_time_sec), 3),
+                "source": source,  # "mmwave" atau "fallback_timer"
                 "fall_status": "FALL DETECTED",
+                "raw": raw_payload or {},
             }
 
             table = self.app_config["table_name"]
@@ -630,29 +800,17 @@ class FallAlarmTester(QMainWindow):
             cursor.execute(f"INSERT INTO `{table}` (data) VALUES (%s)", (json.dumps(data),))
             cursor.close()
 
-            self.status_label.setText("🚨 FALL DETECTED!")
+            self.status_label.setText(f"🚨 FALL DETECTED! ({source})")
             self.status_label.setStyleSheet("color: #ff4757; font-weight: bold;")
+
             QMessageBox.warning(
                 self,
                 "🚨 FALL ALERT",
-                f"Room: {data['room_id']}\nDevice: {data['device_id']}\n"
+                f"Source: {source}\nRoom: {data['room_id']}\nDevice: {data['device_id']}\n"
                 f"Video time: {data['video_time']}\nSaved to table: {table}",
             )
         except Exception as e:
             QMessageBox.critical(self, "DB Error", str(e))
-    # ─── OUT OF BED EVENT -> START TIMER ──────────────────────────────
-    def trigger_out_of_bed(self):
-        if self.fall_sent:
-            return
-
-        # mulai hitung durasi "tidak di kasur"
-        self.out_of_bed_started = True
-        self.out_of_bed_seconds = 0
-        self.warning_sent = False
-        self.oob_timer.start()
-
-        self.status_label.setText("🚶 Pasien keluar kasur (mulai hitung 5 menit)")
-        self.status_label.setStyleSheet("color: #00d4ff; font-weight: bold;")
 
     # ─── HISTORY (reads JSON table) ──────────────────────────────────
     def show_history(self):
@@ -690,6 +848,11 @@ class FallAlarmTester(QMainWindow):
         if self.video_thread:
             self.video_thread.stop()
             self.video_thread.wait()
+
+        if self.mmwave_thread and self.mmwave_thread.isRunning():
+            self.mmwave_thread.stop()
+            self.mmwave_thread.wait(1000)
+
         if self.db_conn and self.db_conn.is_connected():
             self.db_conn.close()
         e.accept()

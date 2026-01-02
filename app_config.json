@@ -1,10 +1,5 @@
 {
-    "db_host": "localhost",
-    "db_port": 3306,
-    "db_user": "root",
-    "db_password": "",
-    "db_name": "fall_detection_db",
-    "table_name": "fall_events",
+    "table_name": "vitals",
     "room_id": "ROOM_01",
     "device_id": "CAM_001"
 }
