@@ -141,39 +141,86 @@ class FallAlarmTester(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("🚨 Fall Detection System")
-        self.resize(1000, 800)
+        self.resize(1000, 850)
         self.setStyleSheet(MODERN_STYLE)
 
         self.video_path = None
         self.video_thread = None
         self.db_config = self.load_db_config()
+        self.app_config = self.load_app_config()
         self.db_conn = None
 
         self.init_ui()
         self.connect_db()
 
-        #RIN
-        self.room_id = "EXECUTIVE-3"   # perbaikan, samakan dengan room_id yang ditulis alat ke DB
-
-        self.db_poll = DbPollThread(self.db_config, self.room_id)
-        self.db_poll.fall_signal.connect(self.on_fall_from_device)
-        self.db_poll.status_signal.connect(self.on_status_from_device)
-        self.db_poll.start()
-    
-
     def load_db_config(self):
         config_file = 'db_config.json'
-        default = {'host':'localhost','port':3306,'database':'fall_detection_db','user':'root','password':''}
+        default = {
+            'host': 'localhost',
+            'port': 3306,
+            'user': 'root',
+            'password': '',
+            'database': 'fall_detection_db'
+        }
         if os.path.exists(config_file):
             try:
                 with open(config_file, 'r') as f:
-                    return json.load(f)
+                    data = json.load(f)
+                    # Gabungkan dengan default untuk hindari key error
+                    for k, v in default.items():
+                        if k not in data:
+                            data[k] = v
+                    return data
+            except:
+                return default
+        # Buat file default jika belum ada
+        with open(config_file, 'w') as f:
+            json.dump(default, f, indent=4)
+        return default
+
+    def save_db_config(self, host, port, user, password, database):
+        self.db_config = {
+            'host': host,
+            'port': int(port),
+            'user': user,
+            'password': password,
+            'database': database
+        }
+        with open('db_config.json', 'w') as f:
+            json.dump(self.db_config, f, indent=4)
+
+    # ─── LOAD & SAVE: APP CONFIG (metadata) ─────────────────────────
+    def load_app_config(self):
+        config_file = 'app_config.json'
+        default = {
+            'table_name': 'fall_events',
+            'room_id': 'ROOM_01',
+            'device_id': 'CAM_001'
+        }
+        if os.path.exists(config_file):
+            try:
+                with open(config_file, 'r') as f:
+                    data = json.load(f)
+                    for k, v in default.items():
+                        if k not in data:
+                            data[k] = v
+                    return data
             except:
                 return default
         with open(config_file, 'w') as f:
-            json.dump(default, f)
+            json.dump(default, f, indent=4)
         return default
 
+    def save_app_config(self, table_name, room_id, device_id):
+        self.app_config = {
+            'table_name': table_name,
+            'room_id': room_id,
+            'device_id': device_id
+        }
+        with open('app_config.json', 'w') as f:
+            json.dump(self.app_config, f, indent=4)
+
+    # ─── DATABASE ───────────────────────────────────────────────────
     def connect_db(self):
         try:
             self.db_conn = mysql.connector.connect(
@@ -195,37 +242,36 @@ class FallAlarmTester(QMainWindow):
 
     def setup_table(self):
         cursor = self.db_conn.cursor()
-        cursor.execute('''CREATE TABLE IF NOT EXISTS fall_events (
-            id INT AUTO_INCREMENT PRIMARY KEY,
-            timestamp DATETIME,
-            video_file VARCHAR(255),
-            fall_time VARCHAR(20),
-            video_current_time VARCHAR(20),
-            status VARCHAR(50)
-        )''')
+        table = self.app_config['table_name']
+        cursor.execute(f"""
+            CREATE TABLE IF NOT EXISTS `{table}` (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                data JSON NOT NULL
+            ) ENGINE=InnoDB
+        """)
         cursor.close()
 
+    # ─── UI ─────────────────────────────────────────────────────────
     def init_ui(self):
         central = QWidget()
         self.setCentralWidget(central)
         layout = QVBoxLayout(central)
 
-        # Title
         title = QLabel("TEST ALARM FALL DETECTION SYSTEM")
         title.setObjectName("titleLabel")
         title.setAlignment(Qt.AlignCenter)
         layout.addWidget(title)
 
-        # DB Status
         db_row = QHBoxLayout()
         self.db_status = QLabel("🔴 Disconnected")
         self.db_status.setObjectName("statusLabel")
-        db_row.addWidget(QPushButton("⚙️ Config", clicked=self.open_db_config))
+        db_row.addWidget(QPushButton("⚙️ DB Config", clicked=self.open_db_config_dialog))
+        db_row.addWidget(QPushButton("🛠️ App Config", clicked=self.open_app_config_dialog))
         db_row.addWidget(self.db_status)
         db_row.addWidget(QPushButton("🔄 Reconnect", clicked=self.connect_db))
         layout.addLayout(db_row)
 
-        # Video Selection
         vid_row = QHBoxLayout()
         vid_row.addWidget(QPushButton("📁 Select Video", clicked=self.select_video))
         self.vid_label = QLabel("No video selected")
@@ -233,7 +279,6 @@ class FallAlarmTester(QMainWindow):
         vid_row.addWidget(self.vid_label)
         layout.addLayout(vid_row)
 
-        # Fall Time Input
         time_row = QHBoxLayout()
         time_row.addWidget(QLabel("⏰ Fall at:"))
         self.min_spin = QSpinBox(minimum=0, maximum=59, value=1, suffix=" min")
@@ -244,7 +289,6 @@ class FallAlarmTester(QMainWindow):
         time_row.addStretch()
         layout.addLayout(time_row)
 
-        # Control Buttons
         btn_row = QHBoxLayout()
         self.start_btn = QPushButton("▶️ START", clicked=self.start_video)
         self.start_btn.setObjectName("startBtn")
@@ -255,7 +299,6 @@ class FallAlarmTester(QMainWindow):
         btn_row.addWidget(self.stop_btn, 1)
         layout.addLayout(btn_row)
 
-        # Video Display
         self.video_display = QLabel()
         self.video_display.setObjectName("videoFrame")
         self.video_display.setMinimumSize(400, 300)
@@ -263,50 +306,77 @@ class FallAlarmTester(QMainWindow):
         self.video_display.setAlignment(Qt.AlignCenter)
         layout.addWidget(self.video_display)
 
-        # Status & Time
         self.time_label = QLabel("00:00 / 00:00")
         self.status_label = QLabel("Ready")
         self.status_label.setObjectName("statusLabel")
         layout.addWidget(self.time_label)
         layout.addWidget(self.status_label)
 
-        # History Button
         layout.addWidget(QPushButton("View History", clicked=self.show_history))
 
-    def open_db_config(self):
+    # ─── DIALOG: DATABASE CONFIG ────────────────────────────────────
+    def open_db_config_dialog(self):
         dialog = QDialog(self)
-        dialog.setWindowTitle("DB Config")
+        dialog.setWindowTitle("Database Configuration")
         form = QFormLayout()
-        host = QLineEdit(self.db_config.get('host', 'localhost'))
-        port = QLineEdit(str(self.db_config.get('port', 3306)))
-        db = QLineEdit(self.db_config.get('database', 'fall_detection_db'))
-        user = QLineEdit(self.db_config.get('user', 'root'))
-        pwd = QLineEdit(self.db_config.get('password', ''))
+
+        host = QLineEdit(self.db_config['host'])
+        port = QLineEdit(str(self.db_config['port']))
+        user = QLineEdit(self.db_config['user'])
+        pwd = QLineEdit(self.db_config['password'])
         pwd.setEchoMode(QLineEdit.Password)
+        db = QLineEdit(self.db_config['database'])
+
         form.addRow("Host", host)
         form.addRow("Port", port)
-        form.addRow("DB", db)
         form.addRow("User", user)
         form.addRow("Password", pwd)
-        save_btn = QPushButton("Save & Reconnect")
-        save_btn.clicked.connect(lambda: self.save_config_and_reconnect(dialog, host, port, db, user, pwd))
+        form.addRow("Database", db)
+
+        save_btn = QPushButton("💾 Save & Reconnect")
+        save_btn.clicked.connect(lambda: self.handle_save_db_config(dialog, host, port, user, pwd, db))
         form.addRow(save_btn)
         dialog.setLayout(form)
         dialog.exec()
 
-    def save_config_and_reconnect(self, dialog, host, port, db, user, pwd):
-        self.db_config = {
-            'host': host.text(),
-            'port': int(port.text()),
-            'database': db.text(),
-            'user': user.text(),
-            'password': pwd.text()
-        }
-        with open('db_config.json', 'w') as f:
-            json.dump(self.db_config, f)
-        self.connect_db()
-        dialog.accept()
+    def handle_save_db_config(self, dialog, host, port, user, pwd, db):
+        try:
+            self.save_db_config(host.text(), port.text(), user.text(), pwd.text(), db.text())
+            self.connect_db()
+            dialog.accept()
+            QMessageBox.information(self, "Success", "Database config saved!")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Invalid input:\n{str(e)}")
 
+    # ─── DIALOG: APP CONFIG (metadata) ──────────────────────────────
+    def open_app_config_dialog(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Application Metadata")
+        form = QFormLayout()
+
+        table = QLineEdit(self.app_config['table_name'])
+        room = QLineEdit(self.app_config['room_id'])
+        device = QLineEdit(self.app_config['device_id'])
+
+        form.addRow("Table Name", table)
+        form.addRow("Room ID", room)
+        form.addRow("Device ID", device)
+
+        save_btn = QPushButton("💾 Save")
+        save_btn.clicked.connect(lambda: self.handle_save_app_config(dialog, table, room, device))
+        form.addRow(save_btn)
+        dialog.setLayout(form)
+        dialog.exec()
+
+    def handle_save_app_config(self, dialog, table, room, device):
+        self.save_app_config(table.text(), room.text(), device.text())
+        # Pastikan tabel dibuat ulang jika nama berubah
+        if self.db_conn and self.db_conn.is_connected():
+            self.setup_table()
+        dialog.accept()
+        QMessageBox.information(self, "Success", "App config saved!")
+
+    # ─── VIDEO & FALL DETECTION ─────────────────────────────────────
     def select_video(self):
         path, _ = QFileDialog.getOpenFileName(self, "Select Video", "", "Video Files (*.mp4 *.avi *.mov *.mkv)")
         if path:
@@ -316,7 +386,7 @@ class FallAlarmTester(QMainWindow):
 
     def start_video(self):
         if not self.video_path:
-            QMessageBox.warning(self, "video not selected", "Please select a video file before starting.")
+            QMessageBox.warning(self, "Select a video first!")
             return
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
@@ -358,19 +428,24 @@ class FallAlarmTester(QMainWindow):
             QMessageBox.critical(self, "Error", "DB not connected!")
             return
         try:
-            now = datetime.now()
-            vid = os.path.basename(self.video_path)
-            fall_t = f"{self.min_spin.value():02}:{self.sec_spin.value():02}"
-            cur_t = self.time_label.text().split(" ")[1].split("/")[0].strip()
+            data = {
+                "room_id": self.app_config['room_id'],
+                "device_id": self.app_config['device_id'],
+                "rr": 0,
+                "hr": 0,
+                "fall_status": "FALL DETECTED"
+            }
+
+            table = self.app_config['table_name']
             cursor = self.db_conn.cursor()
-            cursor.execute(
-                "INSERT INTO fall_events (timestamp, video_file, fall_time, video_current_time, status) VALUES (%s,%s,%s,%s,%s)",
-                (now, vid, fall_t, cur_t, "FALL DETECTED")
-            )
+            cursor.execute(f"INSERT INTO `{table}` (data) VALUES (%s)", (json.dumps(data),))
             cursor.close()
+
             self.status_label.setText("🚨 FALL DETECTED!")
             self.status_label.setStyleSheet("color: #ff4757; font-weight: bold;")
-            QMessageBox.warning(self, "🚨 FALL ALERT", f"Fall at: {fall_t}\nSaved to database.")
+            QMessageBox.warning(self, "🚨 FALL ALERT", 
+                f"Room: {data['room_id']}\nDevice: {data['device_id']}\n"
+                f"Saved to table: {table}")
         except Exception as e:
             QMessageBox.critical(self, "DB Error", str(e))
 
@@ -392,7 +467,6 @@ class FallAlarmTester(QMainWindow):
         if not (self.db_conn and self.db_conn.is_connected()):
             QMessageBox.critical(self, "Error", "DB not connected!")
             return
-             
         dialog = QDialog(self)
         dialog.setWindowTitle("History")
         dialog.resize(900, 500)
