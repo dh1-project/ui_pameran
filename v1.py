@@ -1,4 +1,3 @@
-#tcoding: utf-8
 import sys
 import cv2
 import json
