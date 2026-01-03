@@ -1,0 +1,11 @@
+{
+    "emr_no": "EMR-111",
+    "heart_rate": 72,
+    "respirasi": 16,
+    "jarak_kasur_cm": 0.0,
+    "glukosa": 90.0,
+    "berat_badan_kg": 65.0,
+    "tinggi_badan_cm": 170.0,
+    "sistolik": 120,
+    "diastolik": 80
+}

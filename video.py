@@ -4,6 +4,7 @@ import cv2
 import json
 import os
 from datetime import datetime
+import requests
 
 from PySide6.QtWidgets import (
     QApplication, QDialog, QFileDialog, QFormLayout, QHBoxLayout, QLabel,
@@ -12,7 +13,6 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import QThread, Signal, Qt, QMutex, QWaitCondition
 from PySide6.QtGui import QImage, QPixmap, QFont
-import mysql.connector
 
 
 MODERN_STYLE = """
@@ -131,20 +131,19 @@ class FallAlarmTester(QMainWindow):
 
         self.video_path = None
         self.video_thread = None
-        self.db_config = self.load_db_config()
-        self.patient_data = self.load_patient_data()
-        self.db_conn = None
+        self.api_config = self.load_api_config()
+        self.patient_data = self.load_patient_config()
 
         self.last_frame = 0
         self.fall_triggered = False
         self.current_time_str = "00:00"
 
         self.init_ui()
-        self.connect_db()
 
-    def load_db_config(self):
-        config_file = "db_config.json"
-        default = {"host": "localhost", "port": 3306, "user": "root", "password": "", "database": "darsinurse"}
+    # ─── LOAD CONFIG: API & PATIENT ─────────────────────────────────
+    def load_api_config(self):
+        config_file = "api_config.json"
+        default = {"api_base_url": "http://127.0.0.1:5000"}
         if os.path.exists(config_file):
             try:
                 with open(config_file, "r", encoding="utf-8") as f:
@@ -158,8 +157,9 @@ class FallAlarmTester(QMainWindow):
             json.dump(default, f, indent=4)
         return default
 
-    def load_patient_data(self):
-        return {
+    def load_patient_config(self):
+        config_file = "patient_config.json"
+        default = {
             "emr_no": "EMR-001",
             "heart_rate": 72,
             "respirasi": 16,
@@ -170,43 +170,32 @@ class FallAlarmTester(QMainWindow):
             "diastolik": 80,
             "tinggi_badan_cm": 170.0,
         }
+        if os.path.exists(config_file):
+            try:
+                with open(config_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                # Gabungkan dengan default untuk hindari missing key
+                for k, v in default.items():
+                    data.setdefault(k, v)
+                return data
+            except:
+                return default
+        with open(config_file, "w", encoding="utf-8") as f:
+            json.dump(default, f, indent=4)
+        return default
 
-    def save_db_config(self, host, port, user, password, database):
-        self.db_config = {"host": host, "port": int(port), "user": user, "password": password, "database": database}
-        with open("db_config.json", "w", encoding="utf-8") as f:
-            json.dump(self.db_config, f, indent=4)
+    def save_api_config(self, base_url):
+        self.api_config = {"api_base_url": base_url}
+        with open("api_config.json", "w", encoding="utf-8") as f:
+            json.dump(self.api_config, f, indent=4)
 
-    def connect_db(self):
-        try:
-            if self.db_conn and self.db_conn.is_connected():
-                self.db_conn.close()
-        except:
-            pass
+    def save_patient_config(self, data):
+        # Simpan ke file
+        with open("patient_config.json", "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=4)
+        self.patient_data = data
 
-        try:
-            self.db_conn = mysql.connector.connect(
-                host=self.db_config["host"],
-                port=self.db_config["port"],
-                user=self.db_config["user"],
-                password=self.db_config["password"],
-                database=self.db_config["database"],
-                autocommit=True,
-                connect_timeout=5,
-                charset='utf8mb4'
-            )
-            if self.db_conn.is_connected():
-                self.db_status.setText("🟢 Connected")
-                self.db_status.setStyleSheet("color: #00ff00;")
-                return True
-        except Exception as e:
-            error_msg = str(e)
-            display_msg = error_msg[:50] + "..." if len(error_msg) > 50 else error_msg
-            self.db_status.setText(f"🔴 {display_msg}")
-            self.db_status.setStyleSheet("color: #ff4757;")
-            print(f"[DB ERROR] {e}")
-            self.db_conn = None
-            return False
-
+    # ─── UI ─────────────────────────────────────────────────────────
     def init_ui(self):
         central = QWidget()
         self.setCentralWidget(central)
@@ -217,14 +206,14 @@ class FallAlarmTester(QMainWindow):
         title.setAlignment(Qt.AlignCenter)
         layout.addWidget(title)
 
-        db_row = QHBoxLayout()
-        self.db_status = QLabel("🔴 Disconnected")
-        self.db_status.setObjectName("statusLabel")
-        db_row.addWidget(QPushButton("⚙️ DB Config", clicked=self.open_db_config_dialog))
-        db_row.addWidget(QPushButton("📋 Patient Data", clicked=self.open_patient_dialog))
-        db_row.addWidget(self.db_status)
-        db_row.addWidget(QPushButton("🔄 Reconnect", clicked=self.connect_db))
-        layout.addLayout(db_row)
+        api_row = QHBoxLayout()
+        self.api_status = QLabel("🌐 API: Not tested")
+        self.api_status.setObjectName("statusLabel")
+        api_row.addWidget(QPushButton("⚙️ API Config", clicked=self.open_api_config_dialog))
+        api_row.addWidget(QPushButton("📋 Patient Data", clicked=self.open_patient_dialog))
+        api_row.addWidget(QPushButton("🔍 Test API", clicked=self.test_api_connection))
+        api_row.addWidget(self.api_status)
+        layout.addLayout(api_row)
 
         vid_row = QHBoxLayout()
         vid_row.addWidget(QPushButton("📁 Select Video", clicked=self.select_video))
@@ -292,39 +281,47 @@ class FallAlarmTester(QMainWindow):
             self.status_label.setText("▶️ Monitoring...")
             self.status_label.setStyleSheet("color: #00d4ff;")
 
-    def open_db_config_dialog(self):
+    # ─── DIALOG: API CONFIG ─────────────────────────────────────────
+    def open_api_config_dialog(self):
         dialog = QDialog(self)
-        dialog.setWindowTitle("Database Configuration")
+        dialog.setWindowTitle("API Configuration")
         dialog.setStyleSheet(MODERN_STYLE)
-        form = QFormLayout()
-        host = QLineEdit(self.db_config["host"])
-        port = QLineEdit(str(self.db_config["port"]))
-        user = QLineEdit(self.db_config["user"])
-        pwd = QLineEdit(self.db_config["password"])
-        pwd.setEchoMode(QLineEdit.Password)
-        db = QLineEdit(self.db_config["database"])
-        for w in (host, port, user, pwd, db):
-            w.setStyleSheet("background: #1a1a2e; color: white; border: 1px solid #0f3460;")
-        form.addRow("Host", host)
-        form.addRow("Port", port)
-        form.addRow("User", user)
-        form.addRow("Password", pwd)
-        form.addRow("Database", db)
-        save_btn = QPushButton("💾 Save & Reconnect")
-        save_btn.clicked.connect(lambda: self.handle_save_db_config(dialog, host, port, user, pwd, db))
-        form.addRow(save_btn)
-        dialog.setLayout(form)
+        layout = QVBoxLayout()
+        url_label = QLabel("API Base URL (e.g., http://10.0.1.200:5000):")
+        url_input = QLineEdit(self.api_config["api_base_url"])
+        url_input.setStyleSheet("background: #1a1a2e; color: white; border: 1px solid #0f3460;")
+        layout.addWidget(url_label)
+        layout.addWidget(url_input)
+        save_btn = QPushButton("💾 Save")
+        save_btn.clicked.connect(lambda: self.save_api_config_and_close(dialog, url_input.text()))
+        layout.addWidget(save_btn)
+        dialog.setLayout(layout)
         dialog.exec()
 
-    def handle_save_db_config(self, dialog, host, port, user, pwd, db):
-        try:
-            self.save_db_config(host.text(), port.text(), user.text(), pwd.text(), db.text())
-            self.connect_db()
-            dialog.accept()
-            QMessageBox.information(self, "Success", "Database config saved!")
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Invalid input:\n{str(e)}")
+    def save_api_config_and_close(self, dialog, url):
+        if not url.startswith(("http://", "https://")):
+            QMessageBox.critical(self, "Error", "URL must start with http:// or https://")
+            return
+        self.save_api_config(url)
+        dialog.accept()
+        QMessageBox.information(self, "Success", "API config saved!")
 
+    def test_api_connection(self):
+        try:
+            url = f"{self.api_config['api_base_url']}/health"
+            response = requests.get(url, timeout=5)
+            if response.status_code == 200:
+                self.api_status.setText("🟢 API: Connected")
+                self.api_status.setStyleSheet("color: #00ff00;")
+            else:
+                self.api_status.setText("🔴 API: Error")
+                self.api_status.setStyleSheet("color: #ff4757;")
+        except Exception as e:
+            self.api_status.setText("🔴 API: Disconnected")
+            self.api_status.setStyleSheet("color: #ff4757;")
+            print(f"[API ERROR] {e}")
+
+    # ─── DIALOG: PATIENT DATA ───────────────────────────────────────
     def open_patient_dialog(self):
         dialog = QDialog(self)
         dialog.setWindowTitle("Patient Data (EMR)")
@@ -370,17 +367,13 @@ class FallAlarmTester(QMainWindow):
                     val = raw
                 data[key] = val
 
-            # Hitung BMI
-            berat = data["berat_badan_kg"]
-            tinggi_m = data["tinggi_badan_cm"] / 100
-            data["bmi"] = round(berat / (tinggi_m ** 2), 1) if tinggi_m > 0 else 0.0
-
-            self.patient_data = data
+            self.save_patient_config(data)
             dialog.accept()
-            QMessageBox.information(self, "Success", "Patient data updated!")
+            QMessageBox.information(self, "Success", "Patient data saved to patient_config.json!")
         except Exception as e:
             QMessageBox.critical(self, "Input Error", f"Invalid value:\n{str(e)}")
 
+    # ─── VIDEO & FALL DETECTION ─────────────────────────────────────
     def select_video(self):
         path, _ = QFileDialog.getOpenFileName(self, "Select Video", "", "Video Files (*.mp4 *.avi *.mov *.mkv)")
         if path:
@@ -454,98 +447,73 @@ class FallAlarmTester(QMainWindow):
         self.time_label.setText(f"⏱️ {t}")
         self.current_time_str = t.split("/")[0].strip()
 
+    # ─── API COMMUNICATION ──────────────────────────────────────────
     def trigger_fall(self):
-        if not (self.db_conn and self.db_conn.is_connected()):
-            QMessageBox.critical(self, "Error", "DB not connected!")
-            return
         try:
-            data = self.patient_data.copy()
-            berat = data.get("berat_badan_kg", 0)
-            tinggi = data.get("tinggi_badan_cm", 100)
-            bmi = round(berat / ((tinggi / 100) ** 2), 1) if tinggi > 0 else 0
-            data["bmi"] = bmi
+            # Kirim data yang ada di patient_config.json
+            url = f"{self.api_config['api_base_url']}/fall-events"
+            response = requests.post(url, json=self.patient_data, timeout=10)
 
-            cursor = self.db_conn.cursor()
-            # SIMPAN LANGSUNG KE TABEL vitals (asumsi tabel sudah ada)
-            cursor.execute("""
-                INSERT INTO vitals (
-                    emr_no, heart_rate, respirasi, jarak_kasur_cm, glukosa,
-                    berat_badan_kg, sistolik, diastolik, fall_detected,
-                    tinggi_badan_cm, bmi
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            """, (
-                data["emr_no"],
-                data.get("heart_rate"),
-                data.get("respirasi"),
-                data.get("jarak_kasur_cm"),
-                data.get("glukosa"),
-                data.get("berat_badan_kg"),
-                data.get("sistolik"),
-                data.get("diastolik"),
-                True,  # fall_detected
-                data.get("tinggi_badan_cm"),
-                data.get("bmi")
-            ))
-            cursor.close()
+            if response.status_code == 201:
+                self.status_label.setText("FALL DETECTED!")
+                self.status_label.setStyleSheet("color: #ff4757; font-weight: bold;")
+                QMessageBox.warning(self, "FALL ALERT", f"Data {self.patient_data['emr_no']} saved via API!")
+            else:
+                error_msg = response.json().get("error", "Unknown API error")
+                raise Exception(error_msg)
 
-            self.status_label.setText("FALL DETECTED!")
-            self.status_label.setStyleSheet("color: #ff4757; font-weight: bold;")
-            QMessageBox.warning(self, "FALL ALERT", f"Data pasien {data['emr_no']} disimpan ke tabel vitals.")
         except Exception as e:
-            print(f"[FALL SAVE ERROR] {e}")
-            QMessageBox.critical(self, "DB Error", f"Gagal simpan \n{str(e)}")
+            print(f"[API FALL ERROR] {e}")
+            QMessageBox.critical(self, "API Error", f"Failed to save\n{str(e)}")
 
     def show_history(self):
-        if not (self.db_conn and self.db_conn.is_connected()):
-            QMessageBox.critical(self, "Error", "DB not connected!")
-            return
-
         try:
+            url = f"{self.api_config['api_base_url']}/fall-events"
+            response = requests.get(url, timeout=10)
+            
+            if response.status_code != 200:
+                raise Exception("Failed to fetch history")
+
+            events = response.json()
+            
             dialog = QDialog(self)
-            dialog.setWindowTitle("Vitals History")
+            dialog.setWindowTitle("Fall Events History")
             dialog.resize(1000, 500)
             dialog.setStyleSheet(MODERN_STYLE)
             layout = QVBoxLayout()
 
-            tablew = QTableWidget()
+            table = QTableWidget()
             headers = ["ID", "EMR", "HR", "Resp", "Jarak(cm)", "Glukosa", "Berat(kg)", "Sis", "Dia", "Fall", "Tinggi(cm)", "BMI", "Waktu"]
-            tablew.setColumnCount(len(headers))
-            tablew.setHorizontalHeaderLabels(headers)
-            tablew.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+            table.setColumnCount(len(headers))
+            table.setHorizontalHeaderLabels(headers)
+            table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
 
-            cursor = self.db_conn.cursor()
-            # BACA DARI TABEL vitals (asumsi sudah ada)
-            cursor.execute("""
-                SELECT id, emr_no, heart_rate, respirasi, jarak_kasur_cm, glukosa,
-                       berat_badan_kg, sistolik, diastolik, fall_detected,
-                       tinggi_badan_cm, bmi, created_at
-                FROM vitals ORDER BY id DESC LIMIT 100
-            """)
-            rows = cursor.fetchall()
-            cursor.close()
-
-            tablew.setRowCount(len(rows))
-            for i, row in enumerate(rows):
-                for j, val in enumerate(row):
-                    if j == 9:  # fall_detected
+            table.setRowCount(len(events))
+            for i, event in enumerate(events):
+                for j, key in enumerate([
+                    "id", "emr_no", "heart_rate", "respirasi", "jarak_kasur_cm", "glukosa",
+                    "berat_badan_kg", "sistolik", "diastolik", "fall_detected",
+                    "tinggi_badan_cm", "bmi", "created_at"
+                ]):
+                    val = event.get(key, "")
+                    if key == "fall_detected":
                         display_val = "✅" if val else "❌"
                     else:
                         display_val = str(val) if val is not None else ""
-                    tablew.setItem(i, j, QTableWidgetItem(display_val))
+                    table.setItem(i, j, QTableWidgetItem(display_val))
 
-            layout.addWidget(tablew)
+            layout.addWidget(table)
             dialog.setLayout(layout)
             dialog.exec()
+
         except Exception as e:
             print(f"[HISTORY ERROR] {e}")
-            QMessageBox.critical(self, "Error", f"Gagal muat riwayat:\n{str(e)}")
+            QMessageBox.critical(self, "Error", f"Failed to load history:\n{str(e)}")
 
     def closeEvent(self, e):
         if self.video_thread:
             self.video_thread.stop()
             self.video_thread.wait()
-        if self.db_conn and self.db_conn.is_connected():
-            self.db_conn.close()
         e.accept()
 
 

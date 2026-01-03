@@ -1,7 +1,7 @@
 {
-    "host": "db.darsinurse.hint-lab.id",
+    "host": "127.0.0.1",
     "port": 3306,
-    "user": "darsinurse",
-    "password": "darsinurse123",
+    "user": "root",
+    "password": "",
     "database": "darsinurse"
 }
