@@ -1,0 +1,14 @@
+{
+    "mqtt": {
+        "broker": "localhost",
+        "port": 1883,
+        "topic": "fall_detection/alerts",
+        "username": "",
+        "password": ""
+    },
+    "data": {
+        "room_id": "ROOM_01",
+        "status": false,
+        "nilai_sensor": 0
+    }
+}

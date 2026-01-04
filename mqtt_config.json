@@ -1,0 +1,8 @@
+{
+    "broker": "103.106.72.181",
+    "port": 1883,
+    "topic": "hitam",
+    "room_id": "R.pameran",
+    "username": "capstone",
+    "password": "hint12345"
+}
