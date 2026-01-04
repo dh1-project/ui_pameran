@@ -316,17 +316,17 @@ class FallAlarmTester(QMainWindow):
             payload_hitam = {
                 "room_id": self.data_config.get("room_id", "ROOM_01"),
                 "status": self.data_config.get("status", "PEOPLE"),
-                "nilai_sensor": self.data_config.get("nilai_sensor", 0.0),
+                # "nilai_sensor": self.data_config.get("nilai_sensor", 0.0),
             }
 
             payload_rsi = {
-                "device_id": self.rsi_config.get("device_id", "RSI-001"),
+                "device_id": self.rsi_config.get("device_id", "Dpameran"),
                 "room_id": self.data_config.get("room_id", "ROOM_01"),
                 "breath_rate": self.rsi_config.get("breath_rate", 16),
                 "heart_rate": self.rsi_config.get("heart_rate", 72),
                 "distance": self.rsi_config.get("distance", 0.0),
-                "presence": self._presence_from_status(),
-                "timestamp": self._now_iso(),
+                # "presence": self._presence_from_status(),
+                # "timestamp": self._now_iso(),
             }
 
             r1 = self.mqtt_client.publish(
