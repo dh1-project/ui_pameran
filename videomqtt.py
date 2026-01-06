@@ -1,4 +1,3 @@
-# coding: utf-8
 import sys
 import cv2
 import json
@@ -8,7 +7,7 @@ from datetime import datetime, timezone
 from PySide6.QtWidgets import (
     QApplication, QDialog, QFileDialog, QFormLayout, QHBoxLayout, QLabel,
     QLineEdit, QMainWindow, QMessageBox, QPushButton, QSizePolicy, QSpinBox,
-    QVBoxLayout, QWidget, QHeaderView, QComboBox
+    QVBoxLayout, QWidget, QComboBox
 )
 from PySide6.QtCore import QThread, Signal, Qt, QMutex, QWaitCondition
 from PySide6.QtGui import QImage, QPixmap, QFont
@@ -25,12 +24,12 @@ QGroupBox { border: 2px solid #0f3460; border-radius: 8px; padding: 12px; backgr
 QPushButton { background: #0f3460; border: 2px solid #00d4ff; border-radius: 6px; padding: 8px; color: white; }
 QPushButton#startBtn { background: qlineargradient(x1:0,y1:0,x2:0,y2:1,stop:0 #00d4ff,stop:1 #0099cc); }
 QPushButton#stopBtn { background: #ff4757; }
-QLineEdit, QSpinBox, QComboBox { 
-    background: #1a1a2e; 
-    border: 2px solid #0f3460; 
-    border-radius: 4px; 
-    padding: 6px; 
-    color: #ffffff; 
+QLineEdit, QSpinBox, QComboBox {
+    background: #1a1a2e;
+    border: 2px solid #0f3460;
+    border-radius: 4px;
+    padding: 6px;
+    color: #ffffff;
 }
 QLineEdit:focus, QSpinBox:focus, QComboBox:focus { border: 2px solid #00d4ff; }
 QLabel#titleLabel { font-size: 22px; color: #00d4ff; font-weight: bold; }
@@ -45,10 +44,10 @@ QLabel#statusLabel { font-weight: bold; }
 class VideoThread(QThread):
     change_pixmap = Signal(QImage)
     update_time = Signal(str)
-    fall_detected = Signal()
+    fall_time_reached = Signal()   # <-- sinyal saat waktu jatuh tercapai (bukan berarti jatuh)
     finished = Signal()
 
-    def __init__(self, video_path, fall_time_sec, start_frame=0, fall_already_triggered=False):
+    def __init__(self, video_path, fall_time_sec, start_frame=0, already_emitted=False):
         super().__init__()
         self.video_path = video_path
         self.fall_time_sec = fall_time_sec
@@ -58,7 +57,7 @@ class VideoThread(QThread):
         self._pause_cond = QWaitCondition()
         self.start_frame = start_frame
         self.current_frame = start_frame
-        self.fall_triggered = fall_already_triggered
+        self._event_emitted = already_emitted
 
     def run(self):
         cap = cv2.VideoCapture(self.video_path)
@@ -90,9 +89,10 @@ class VideoThread(QThread):
             tot = f"{int(total_time//60):02}:{int(total_time%60):02}"
             self.update_time.emit(f"{cur} / {tot}")
 
-            if (not self.fall_triggered) and current_time >= self.fall_time_sec:
-                self.fall_detected.emit()
-                self.fall_triggered = True
+            # Saat waktu event tercapai, emit sekali saja
+            if (not self._event_emitted) and (current_time >= self.fall_time_sec):
+                self.fall_time_reached.emit()
+                self._event_emitted = True
 
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             h, w, ch = rgb.shape
@@ -125,6 +125,10 @@ class VideoThread(QThread):
         self._mutex.unlock()
         return p
 
+    @property
+    def event_emitted(self):
+        return self._event_emitted
+
 
 # =========================
 # MAIN WINDOW
@@ -144,7 +148,7 @@ class FallAlarmTester(QMainWindow):
         self.rsi_config = self.load_rsi_config()       # untuk topic rsi/data
 
         self.last_frame = 0
-        self.fall_triggered = False
+        self.event_emitted = False  # apakah waktu jatuh sudah pernah terpanggil
         self.current_time_str = "00:00"
 
         self.mqtt_client = None
@@ -252,6 +256,7 @@ class FallAlarmTester(QMainWindow):
                 pass
             self.mqtt_client = None
 
+        # paho-mqtt 2.x but still compatible
         try:
             self.mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
         except Exception:
@@ -294,40 +299,48 @@ class FallAlarmTester(QMainWindow):
         self.mqtt_status.setText("🔴 MQTT: Disconnected")
         self.mqtt_status.setStyleSheet("color: #ff4757;")
 
-    def _presence_from_status(self) -> bool:
+    def _presence_from_status(self, status_value: str) -> bool:
         # NO_PEOPLE => False, selain itu True
-        return self.data_config.get("status") != "NO_PEOPLE"
+        return status_value != "NO_PEOPLE"
 
     def _now_iso(self) -> str:
-        # Timestamp ISO (UTC). Kalau mau WIB: hapus timezone.utc
         return datetime.now(timezone.utc).isoformat()
 
-    def publish_alerts(self):
+    def publish_alerts(self, *, status_override=None, fall_detected=None):
         """
         Publish 2 topics:
-        - topic_hitam: status, room_id, nilai_sensor
-        - topic_rsi  : device_id, room_id, breath_rate, heart_rate, distance, presence, timestamp
+        - topic_hitam: room_id, status, nilai_sensor, fall_detected, timestamp
+        - topic_rsi  : device_id, room_id, breath_rate, heart_rate, distance, presence, fall_detected, timestamp
         """
         if not self.mqtt_connected:
             QMessageBox.critical(self, "MQTT Error", "Not connected to MQTT broker!")
             return False
 
         try:
+            status_value = status_override or self.data_config.get("status", "PEOPLE")
+            presence = self._presence_from_status(status_value)
+            ts = self._now_iso()
+
             payload_hitam = {
                 "room_id": self.data_config.get("room_id", "ROOM_01"),
-                "status": self.data_config.get("status", "PEOPLE"),
-                # "nilai_sensor": self.data_config.get("nilai_sensor", 0.0),
+                "status": status_value,
+                "nilai_sensor": self.data_config.get("nilai_sensor", 0.0),
+                "timestamp": ts
             }
 
             payload_rsi = {
-                "device_id": self.rsi_config.get("device_id", "Dpameran"),
+                "device_id": self.rsi_config.get("device_id", "RSI-001"),
                 "room_id": self.data_config.get("room_id", "ROOM_01"),
                 "breath_rate": self.rsi_config.get("breath_rate", 16),
                 "heart_rate": self.rsi_config.get("heart_rate", 72),
                 "distance": self.rsi_config.get("distance", 0.0),
-                # "presence": self._presence_from_status(),
-                # "timestamp": self._now_iso(),
+                "presence": presence,
+                "timestamp": ts
             }
+
+            if fall_detected is not None:
+                payload_hitam["fall_detected"] = int(bool(fall_detected))
+                payload_rsi["fall_detected"] = int(bool(fall_detected))
 
             r1 = self.mqtt_client.publish(
                 self.mqtt_config.get("topic_hitam", "hitam"),
@@ -378,7 +391,7 @@ class FallAlarmTester(QMainWindow):
         layout.addLayout(vid_row)
 
         time_row = QHBoxLayout()
-        time_row.addWidget(QLabel("⏰ Fall at:"))
+        time_row.addWidget(QLabel("⏰ Event at (time reach):"))
         self.min_spin = QSpinBox(minimum=0, maximum=59, value=1, suffix=" min")
         self.sec_spin = QSpinBox(minimum=0, maximum=59, value=30, suffix=" sec")
         time_row.addWidget(self.min_spin)
@@ -418,6 +431,15 @@ class FallAlarmTester(QMainWindow):
         layout.addWidget(self.status_label)
 
         layout.addWidget(QPushButton("📊 View Config", clicked=self.show_all_config))
+        layout.addWidget(QPushButton("📨 Publish Now (send current config)", clicked=self.publish_now))
+
+    def publish_now(self):
+        ok = self.publish_alerts(status_override=None, fall_detected=False)
+        if ok:
+            self.status_label.setText("📨 Published current config (no fall).")
+            self.status_label.setStyleSheet("color: #00d4ff;")
+        else:
+            QMessageBox.critical(self, "MQTT Error", "Failed to publish!")
 
     def on_video_clicked(self, event):
         if event.button() == Qt.LeftButton:
@@ -541,7 +563,6 @@ class FallAlarmTester(QMainWindow):
         for w in (device_id, heart_rate, breath_rate, distance):
             w.setStyleSheet("background: #1a1a2e; color: white; border: 1px solid #0f3460;")
 
-        # room_id ditarik dari data_config (biar konsisten), jadi tampil saja
         room_view = QLabel(self.data_config.get("room_id", "ROOM_01"))
         room_view.setStyleSheet("color:#00d4ff; font-weight:bold;")
 
@@ -597,7 +618,7 @@ class FallAlarmTester(QMainWindow):
         self.setup_mqtt()
 
     # -------------------------
-    # VIDEO + FALL TRIGGER
+    # VIDEO + EVENT LOGIC
     # -------------------------
     def select_video(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -626,27 +647,30 @@ class FallAlarmTester(QMainWindow):
         self.status_label.setStyleSheet("color: #00d4ff;")
 
         total_sec = self.min_spin.value() * 60 + self.sec_spin.value()
+
         self.video_thread = VideoThread(
             self.video_path,
             total_sec,
             start_frame=self.last_frame,
-            fall_already_triggered=self.fall_triggered,
+            already_emitted=self.event_emitted,
         )
         self.video_thread.change_pixmap.connect(self.update_frame)
         self.video_thread.update_time.connect(self.update_time)
-        self.video_thread.fall_detected.connect(self.trigger_fall)
+        self.video_thread.fall_time_reached.connect(self.on_event_time_reached)
         self.video_thread.finished.connect(self.on_video_finished)
         self.video_thread.start()
 
     def stop_video(self):
         if self.video_thread and self.video_thread.isRunning():
             self.last_frame = self.video_thread.current_frame
-            self.fall_triggered = self.video_thread.fall_triggered
+            self.event_emitted = self.video_thread.event_emitted
             self.video_thread.stop()
             self.video_thread.wait(1000)
 
+        # reset full stop
         self.last_frame = 0
-        self.fall_triggered = False
+        self.event_emitted = False
+
         self.start_btn.setEnabled(True)
         self.pause_btn.setEnabled(False)
         self.pause_btn.setText("⏸️ PAUSE")
@@ -657,7 +681,7 @@ class FallAlarmTester(QMainWindow):
 
     def on_video_finished(self):
         self.last_frame = 0
-        self.fall_triggered = False
+        self.event_emitted = False
         self.start_btn.setEnabled(True)
         self.pause_btn.setEnabled(False)
         self.stop_btn.setEnabled(False)
@@ -676,30 +700,32 @@ class FallAlarmTester(QMainWindow):
         self.time_label.setText(f"⏱️ {t}")
         self.current_time_str = t.split("/")[0].strip()
 
-    def trigger_fall(self):
-        success = self.publish_alerts()
-        if success:
-            presence = self._presence_from_status()
-            ts = self._now_iso()
-            self.status_label.setText("🚨 FALL DETECTED!")
-            self.status_label.setStyleSheet("color: #ff4757; font-weight: bold;")
-            QMessageBox.warning(
-                self, "FALL ALERT",
-                f"[hitam]\n"
-                f"room_id: {self.data_config.get('room_id')}\n"
-                f"status: {self.data_config.get('status')}\n"
-                f"nilai_sensor: {self.data_config.get('nilai_sensor')}\n\n"
-                f"[rsi/data]\n"
-                f"device_id: {self.rsi_config.get('device_id')}\n"
-                f"room_id: {self.data_config.get('room_id')}\n"
-                f"breath_rate: {self.rsi_config.get('breath_rate')}\n"
-                f"heart_rate: {self.rsi_config.get('heart_rate')}\n"
-                f"distance: {self.rsi_config.get('distance')}\n"
-                f"presence: {presence}\n"
-                f"timestamp: {ts}"
-            )
+    def on_event_time_reached(self):
+        """
+        Ini dipanggil ketika waktu yang ditentukan tercapai.
+        FALL hanya dianggap terjadi jika status config = PEOPLE_FALL.
+        """
+        self.event_emitted = True
+
+        status_cfg = self.data_config.get("status", "PEOPLE")
+
+        # SELALU publish sesuai config (biar dashboard tetap dapat data),
+        # tapi fall_detected hanya True jika status_cfg == PEOPLE_FALL
+        if status_cfg == "PEOPLE_FALL":
+            ok = self.publish_alerts(status_override="PEOPLE_FALL", fall_detected=True)
+            if ok:
+                self.status_label.setText("🚨 FALL DETECTED! (PEOPLE_FALL)")
+                self.status_label.setStyleSheet("color: #ff4757; font-weight: bold;")
+                QMessageBox.warning(self, "FALL ALERT", "🚨 FALL DETECTED! Data jatuh terkirim ke MQTT.")
+            else:
+                QMessageBox.critical(self, "MQTT Error", "Failed to send FALL MQTT alerts!")
         else:
-            QMessageBox.critical(self, "MQTT Error", "Failed to send MQTT alerts!")
+            ok = self.publish_alerts(status_override=status_cfg, fall_detected=False)
+            if ok:
+                self.status_label.setText(f"⏱️ Event time reached (NO FALL). status={status_cfg}")
+                self.status_label.setStyleSheet("color: #ffd32a; font-weight: bold;")
+            else:
+                QMessageBox.critical(self, "MQTT Error", "Failed to publish at event time!")
 
     def closeEvent(self, e):
         if self.video_thread:
